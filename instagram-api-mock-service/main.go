@@ -91,6 +91,7 @@ func main() {
 				for {
 					publishMedia(conn, *media)
 					updateMedia(media)
+					time.Sleep(300 * time.Millisecond)
 				}
 			}(&user.Media[idx])
 

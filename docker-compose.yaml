@@ -1,10 +1,9 @@
 services:
-  instagram-api-mock:
+  instagram-api-mock-service:
     build:
       context: ./instagram-api-mock-service 
       dockerfile: Dockerfile
     command: "-kafkaBootstrapServers=kafka:9092"
-
 
   kafka-ui:
     image: docker.io/provectuslabs/kafka-ui:latest
@@ -24,7 +23,9 @@ services:
       - ALLOW_PLAINTEXT_LISTENER=yes
 
   clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:22.2
+    build:
+      context: ./clickhouse
+      dockerfile: Dockerfile
     ports:
       - "8123:8123"
       - "19000:9000"
@@ -40,7 +41,9 @@ services:
       - "minio_data:/data"
 
   postgres:
-    image: docker.io/postgres:15
+    build:
+      context: ./postgresql
+      dockerfile: Dockerfile
     ports:
       - "5432:5432"
     volumes:
