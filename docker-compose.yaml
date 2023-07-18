@@ -1,0 +1,59 @@
+services:
+  instagram-api-mock:
+    build:
+      context: ./instagram-api-mock-service 
+      dockerfile: Dockerfile
+    command: "-kafkaBootstrapServers=kafka:9092"
+
+
+  kafka-ui:
+    image: docker.io/provectuslabs/kafka-ui:latest
+    ports:
+    - "8080:8080"
+    environment:
+      - DYNAMIC_CONFIG_ENABLED=true
+
+  kafka:
+    image: docker.io/bitnami/kafka:3.5
+    hostname: kafka
+    ports:
+      - "9092:9092"
+    volumes:
+      - "kafka_data:/bitnami"
+    environment:
+      - ALLOW_PLAINTEXT_LISTENER=yes
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:22.2
+    ports:
+      - "8123:8123"
+      - "19000:9000"
+    volumes:
+      - "clickhouse_data:/var/lib/clickhouse"
+
+  minio:
+    image: quay.io/minio/minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - "minio_data:/data"
+
+  postgres:
+    image: docker.io/postgres:15
+    ports:
+      - "5432:5432"
+    volumes:
+      - "postgres_data:/var/lib/postgresql/data"
+    environment:
+      - POSTGRES_PASSWORD=test
+
+volumes:
+  clickhouse_data:
+    driver: local
+  minio_data:
+    driver: local
+  postgres_data:
+    driver: local
+  kafka_data:
+    driver: local
