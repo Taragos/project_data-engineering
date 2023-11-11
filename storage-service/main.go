@@ -4,107 +4,160 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
+	"os"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/gofrs/uuid"
 	_ "github.com/lib/pq"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/segmentio/kafka-go"
 )
 
-type IGUser struct {
-	Id   uuid.UUID `json:"id"`
-	Name string    `json:"name"`
+func loadEnvOrCrash(env string) string {
+	result, exists := os.LookupEnv(env)
 
-	FollowersCount int `json:"followers_count"`
-	FollowsCount   int `json:"follows_count"`
+	if !exists {
+		log.Fatal("env variable not set: ", env)
+	}
 
-	Media []IGMedia `json:"media"`
+	return result
 }
 
-type IGMedia struct {
-	Id uuid.UUID `json:"id"`
+func setupDatabase() *sql.DB {
+	pgHost := loadEnvOrCrash("POSTGRES_HOST")
+	pgPort := loadEnvOrCrash("POSTGRES_PORT")
+	pgPassword := loadEnvOrCrash("POSTGRES_PASSWORD")
+	pgUser := loadEnvOrCrash("POSTGRES_USER")
+	pgDb := loadEnvOrCrash("POSTGRES_DB")
 
-	MediaType string `json:"media_type"`
-	MediaUrl  string `json:"media_url"`
-	Caption   string `json:"caption"`
+	pgUrl := fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable", pgUser, pgPassword, pgHost, pgPort, pgDb)
 
-	IsCommentEnabled bool `json:"is_comment_enabled"`
-	CommentsCount    int  `json:"comments_count"`
-	LikeCount        int  `json:"like_count"`
+	db, err := sql.Open("postgres", pgUrl)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(5 * time.Minute)
 
-	Timestamp time.Time `json:"timestamp"`
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	Insights IGInsight `json:"insights"`
+	return db
+
 }
 
-type IGInsight struct {
-	Engagement  int `json:"engagement"`
-	Impressions int `json:"impressions"`
-	Reach       int `json:"reach"`
-	Saved       int `json:"saved"`
+/*
+Creates minio client, waits for minio to be responsive and creates required bucket if it doesn't exist already
+*/
+func setupMinio() *minio.Client {
+
+	s3Endpoint := loadEnvOrCrash("S3_ENDPOINT")
+	s3AccessKeyID := loadEnvOrCrash("S3_ACCESS_KEY_ID")
+	s3SecretAccessKey := loadEnvOrCrash("S3_SECRET_ACCESS_KEY")
+
+	minioClient, err := minio.New(s3Endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(s3AccessKeyID, s3SecretAccessKey, ""),
+		Secure: false,
+	})
+	if err != nil {
+		log.Fatal("could not open connection to minio: ", err)
+	}
+	cancel, err := minioClient.HealthCheck(time.Second * 5)
+	if err != nil {
+		log.Fatal("healthcheck already running", err)
+	}
+
+	for minioClient.IsOffline() {
+		time.Sleep(time.Second * 5)
+		log.Println("Minio still offline")
+	}
+	cancel()
+
+	return minioClient
+}
+
+func setupBucket(minioClient *minio.Client, bucket string) {
+	exists, err := minioClient.BucketExists(context.Background(), bucket)
+
+	if err != nil {
+		log.Fatal("could not check whether bucket exists or not: ", err)
+	}
+
+	if !exists {
+		minioClient.MakeBucket(context.Background(), bucket, minio.MakeBucketOptions{})
+		policy := `{ "Version": "2012-10-17", "Statement": [ { "Effect": "Allow", "Principal": { "AWS": [ "*" ] }, "Action": [ "s3:GetBucketLocation", "s3:ListBucket" ], "Resource": [ "arn:aws:s3:::test" ] }, { "Effect": "Allow", "Principal": { "AWS": [ "*" ] }, "Action": [ "s3:GetObject" ], "Resource": [ "arn:aws:s3:::test/*" ] } ] }`
+		minioClient.SetBucketPolicy(context.Background(), bucket, policy)
+	}
+}
+
+func setupKafka(id int) *kafka.Reader {
+	kafkaBootstrapServers := loadEnvOrCrash("KAFKA_BOOTSTRAP_SERVERS")
+	return kafka.NewReader(kafka.ReaderConfig{
+		Brokers:   []string{kafkaBootstrapServers},
+		Topic:     "instagram-profiles",
+		Partition: 0,
+		MaxBytes:  10e6,
+	})
 }
 
 func main() {
 	// 1. Establish Connection to PostgreSQL + Clickhouse
-	connStr := "postgresql://postgres:test@localhost:5432/postgres?sslmode=disable"
 
-	db, err := sql.Open("postgres", connStr)
+	s3Bucket := loadEnvOrCrash("S3_BUCKET")
 
-	if err != nil {
-		log.Fatal("could not open connecting to postgres: ", err)
+	db := setupDatabase()
+	minioClient := setupMinio()
+	setupBucket(minioClient, s3Bucket)
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < 1; i++ {
+		wg.Add(1)
+		go worker(db, minioClient, s3Bucket, i)
 	}
 
-	go func(db *sql.DB) {
-		r := kafka.NewReader(kafka.ReaderConfig{
-			Brokers:   []string{"localhost:9092"},
-			Topic:     "instagram-profiles",
-			Partition: 0,
-			MaxBytes:  10e6,
-		})
-		defer r.Close()
+	wg.Wait()
+}
 
-		for {
-			m, err := r.ReadMessage(context.Background())
-			if err != nil {
-				log.Fatal("could not read message: ", err)
-			}
+/*
+Main worker process that subscribes to Kafka and handles new IG objects
+*/
+func worker(db *sql.DB, minioClient *minio.Client, bucket string, id int) {
+	// 2	. Establish Connection to Kafka
+	kafka := setupKafka(id)
+	defer kafka.Close()
 
-			user := IGUser{}
-			json.Unmarshal(m.Value, &user)
-
-			log.Print("test")
-			// If User does not exist -> Create
-			_, err = db.Exec(`INSERT INTO "ig_profiles"(id, name) values($1, $2) ON CONFLICT DO NOTHING`, user.Id, user.Name)
-			if err != nil {
-				log.Println(err)
-			}
-
-			for idx := range user.Media {
-				media := user.Media[idx]
-				_, err = db.Exec(`INSERT INTO "ig_media"(id, profile_id, media_type, media_url, caption, is_comment_enabled, ig_created_at) values($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING`,
-					media.Id,
-					user.Id,
-					media.MediaType,
-					media.MediaUrl,
-					media.Caption,
-					media.IsCommentEnabled,
-					media.Timestamp,
-				)
-
-				if err != nil {
-					log.Println(err)
-				}
-			}
-		}
-	}(db)
+	userCache := make(map[uuid.UUID][]uuid.UUID)
 
 	for {
+		// 3. Consume Message
+		m, err := kafka.ReadMessage(context.Background())
+		if err != nil {
+			log.Fatal("could not read message: ", err)
+		}
+
+		user := IGUser{}
+		json.Unmarshal(m.Value, &user)
+		userMedias, ok := userCache[user.Id]
+		if !ok {
+			insertUserIntoDB(user, db)
+			userMedias = []uuid.UUID{}
+		}
+
+		for idx := range user.Media {
+			media := user.Media[idx]
+			if slices.Contains(userMedias, media.Id) {
+				continue
+			}
+			insertMediaIntoDB(media, user.Id, db)
+			uploadImageToS3(media, minioClient, bucket)
+			userMedias = append(userMedias, media.Id)
+		}
+
+		userCache[user.Id] = userMedias
 	}
-
-	// 2. Establish Connection to Kafka
-	// 3. Consume Message
-	// 3.1 Check if Profile exists 	-> Update/Create
-	// 3.2 Check if Medias exist 	-> Update/Create
-
 }

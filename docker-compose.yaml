@@ -1,16 +1,85 @@
+version: "3.4"
+x-common-variables: &common-variables
+  S3_EXTERNAL_ENDPOINT: "localhost:10002"
+  S3_ENDPOINT: "minio:10002"
+  S3_ACCESS_KEY_ID: "admin"
+  S3_SECRET_ACCESS_KEY: "admin123"
+  S3_BUCKET: "test"
+  POSTGRES_USER: "postgres"
+  POSTGRES_PASSWORD: "test"
+  POSTGRES_DB: "postgres"
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  CLICKHOUSE_ENDPOINT: "clickhouse:9000"
+  DATA_ACCESS_SERVICE_HOST: "data-access-service"
+  DATA_ACCESS_SERVICE_PORT: "3001"
+  KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
+
 services:
   instagram-api-mock-service:
     build:
       context: ./instagram-api-mock-service 
       dockerfile: Dockerfile
-    command: "-kafkaBootstrapServers=kafka:9092"
+    environment: 
+      <<: *common-variables
+      NUM_PROFILES: 10
+      NUM_PICTURES_PER_PROFILE: 10
+      INSIGHT_UPDATE_FREQ_MS: 30
+      PROFILE_UPDATE_FREQ_MS: 50
+    ports:
+      - "3000:3000"
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  storage-service:
+    build:
+      context: ./storage-service
+      dockerfile: Dockerfile
+    environment: *common-variables
+    depends_on: 
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  visualization-service:
+    build: 
+      context: ./visualization-service
+      dockerfile: Dockerfile
+    environment: *common-variables
+    ports:
+      - "5173:3000"
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  data-access-service:
+    build:
+      context: ./data-access-service
+      dockerfile: Dockerfile
+    environment: *common-variables
+    ports:
+      - "3001:3001"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
 
   kafka-ui:
     image: docker.io/provectuslabs/kafka-ui:latest
     ports:
     - "8080:8080"
     environment:
-      - DYNAMIC_CONFIG_ENABLED=true
+      - KAFKA_CLUSTERS_0_NAME=project_data-engineering
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+    depends_on:
+      - kafka
 
   kafka:
     image: docker.io/bitnami/kafka:3.5
@@ -21,6 +90,12 @@ services:
       - "kafka_data:/bitnami"
     environment:
       - ALLOW_PLAINTEXT_LISTENER=yes
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server 127.0.0.1:9092 --list"]      
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
 
   clickhouse:
     build:
@@ -31,14 +106,25 @@ services:
       - "19000:9000"
     volumes:
       - "clickhouse_data:/var/lib/clickhouse"
+    depends_on:
+      - kafka
 
   minio:
-    image: quay.io/minio/minio
+    image: quay.io/minio/minio:latest
+    command: "server /data --address=:10002 --console-address=:10001"
+    environment:
+      MINIO_ROOT_USER: "admin"
+      MINIO_ROOT_PASSWORD: "admin123"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "10002:10002"
+      - "10001:10001"
     volumes:
       - "minio_data:/data"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10002/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
 
   postgres:
     build:
@@ -48,8 +134,12 @@ services:
       - "5432:5432"
     volumes:
       - "postgres_data:/var/lib/postgresql/data"
-    environment:
-      - POSTGRES_PASSWORD=test
+    environment: *common-variables
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
 
 volumes:
   clickhouse_data:

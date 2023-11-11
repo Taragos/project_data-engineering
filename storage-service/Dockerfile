@@ -20,9 +20,7 @@ COPY . .
 RUN go mod download
 RUN go mod verify
 
-RUN GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /go/bin/instagram-api-mock-service
-
-RUN mkdir /go/bin/images/
+RUN GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /go/bin/storage-service
 
 FROM scratch
 
@@ -31,11 +29,10 @@ COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
 
 # Copy our static executable.
-COPY --from=builder /go/bin/instagram-api-mock-service /go/bin/instagram-api-mock-service
-COPY --from=builder --chown=appuser /go/bin/images images
-# Use an unprivileged user.
+COPY --from=builder /go/bin/storage-service /go/bin/storage-service
 
+# Use an unprivileged user.
 USER appuser:appuser
 
 # Run the hello binary.
-ENTRYPOINT ["/go/bin/instagram-api-mock-service"]
+ENTRYPOINT ["/go/bin/storage-service"]
